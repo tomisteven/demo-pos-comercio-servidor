@@ -9,7 +9,11 @@ const connectDB = async () => {
   if (cached) return cached;
 
   cached = mongoose
-    .connect(process.env.MONGODB_URI)
+    .connect(process.env.MONGODB_URI, {
+      // < bufferTimeoutMS (10s): así el error real de conexión aparece en los
+      // logs antes del "findOne() buffering timed out" genérico.
+      serverSelectionTimeoutMS: 8000,
+    })
     .then((conn) => {
       console.log(`MongoDB Connected: ${conn.connection.host}`);
       return conn;

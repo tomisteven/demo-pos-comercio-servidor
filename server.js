@@ -6,9 +6,12 @@ const morgan = require('morgan');
 const connectDB = require('./src/config/db');
 const { notFound, errorHandler } = require('./src/middlewares/errorHandler');
 
-// Forzar resolvers DNS públicos para evitar que routers locales rechacen
-// las consultas SRV de MongoDB Atlas (error "querySrv ECONNREFUSED")
-dns.setServers(['8.8.8.8', '1.1.1.1']);
+// Forzar resolvers DNS públicos SOLO en local: evita que routers locales
+// rechacen las consultas SRV de MongoDB Atlas (error "querySrv ECONNREFUSED").
+// En Vercel/serverless no aplica y solo agrega un punto de falla.
+if (!process.env.VERCEL) {
+  dns.setServers(['8.8.8.8', '1.1.1.1']);
+}
 
 // Rutas
 const authRoutes = require('./src/routes/authRoutes');
