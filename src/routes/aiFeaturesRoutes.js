@@ -1,0 +1,26 @@
+const express = require('express');
+const router = express.Router();
+const {
+  analizarRestock,
+  analizarPrecios,
+  analizarClientesInactivos,
+  analizarTendencias,
+  generarPromocionesIA,
+  chatbotCatalogo,
+  crearComboProducto,
+  analizarVentas,
+  consultarDatos,
+} = require('../controllers/aiFeaturesController');
+const { protect } = require('../middlewares/auth');
+
+router.get('/restock', protect, analizarRestock);
+router.get('/precios', protect, analizarPrecios);
+router.get('/clientes-inactivos', protect, analizarClientesInactivos);
+router.get('/tendencias', protect, analizarTendencias);
+router.get('/promociones-ia', protect, generarPromocionesIA);
+router.get('/analisis-ventas', protect, analizarVentas);
+router.post('/preguntar', protect, consultarDatos);
+router.post('/crear-combo', protect, crearComboProducto);
+router.post('/chatbot', protect, chatbotCatalogo);
+
+module.exports = router;

@@ -1,0 +1,1213 @@
+ const mongoose = require('mongoose');
+const Sale = require('../models/Sale');
+const Product = require('../models/Product');
+const Expense = require('../models/Expense');
+
+// Helper para obtener el inicio del día en Argentina (UTC-3)
+const getArgStartOfDay = (date = new Date()) => {
+  const argDateStr = date.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+  const [y, m, d] = argDateStr.split('-').map(Number);
+  // Argentina es UTC-3, por lo que 00:00 local es 03:00 UTC
+  return new Date(Date.UTC(y, m - 1, d, 3, 0, 0, 0));
+};
+
+// Helper para obtener el rango de fechas según el período
+const getDateRange = (period, dateStr, yearStr, monthStr) => {
+  let start, end;
+  const now = new Date();
+
+  switch (period) {
+    case 'daily':
+      if (dateStr) {
+        const [y, m, d] = dateStr.split('-').map(Number);
+        start = new Date(Date.UTC(y, m - 1, d, 3, 0, 0, 0));
+      } else {
+        start = getArgStartOfDay(now);
+      }
+      end = new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
+      break;
+    case 'weekly':
+      // Para semanal, retrocedemos al principio de la semana según Arg
+      if (dateStr) {
+        const [y, m, d] = dateStr.split('-').map(Number);
+        start = new Date(Date.UTC(y, m - 1, d, 3, 0, 0, 0));
+      } else {
+        const argNow = getArgStartOfDay(now);
+        // getDay() devuelve el día de la semana (0-6)
+        // Pero tenemos que tener cuidado porque argNow es UTC (las 03:00)
+        // La fecha UTC de argNow es el mismo día civil que en Arg
+        const dayOfWeek = argNow.getUTCDay(); 
+        start = new Date(argNow.getTime() - dayOfWeek * 24 * 60 * 60 * 1000);
+      }
+      end = new Date(start.getTime() + 7 * 24 * 60 * 60 * 1000 - 1);
+      break;
+    case 'monthly':
+      const yStr = yearStr ? parseInt(yearStr) : parseInt(now.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).split('-')[0]);
+      const mStr = monthStr ? parseInt(monthStr) - 1 : parseInt(now.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).split('-')[1]) - 1;
+      start = new Date(Date.UTC(yStr, mStr, 1, 3, 0, 0, 0));
+      end = new Date(Date.UTC(yStr, mStr + 1, 0, 23, 59, 59, 999) + 3 * 3600 * 1000);
+      break;
+    case 'annual':
+      const yr = yearStr ? parseInt(yearStr) : parseInt(now.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).split('-')[0]);
+      start = new Date(Date.UTC(yr, 0, 1, 3, 0, 0, 0));
+      end = new Date(Date.UTC(yr, 11, 31, 23, 59, 59, 999) + 3 * 3600 * 1000);
+      break;
+    default:
+      start = new Date(0);
+      end = new Date();
+  }
+  return { start, end };
+};
+
+const buildReportAggregation = async (startDate, endDate, groupByFormat) => {
+  const matchStage = {
+    $match: {
+      fecha: { $gte: startDate, $lte: endDate },
+      estado: 'completada'
+    }
+  };
+
+  const mainStats = await Sale.aggregate([
+    matchStage,
+    {
+      $unwind: '$items'
+    },
+    {
+      $group: {
+        _id: '$_id', // Agrupar por venta primero para sumar totales correctamente y no duplicar monto pagado
+        totalFinal: { $first: '$totalFinal' },
+        metodoPago: { $first: '$metodoPago' },
+        fecha: { $first: '$fecha' },
+        impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+        costoVenta: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+      }
+    },
+    {
+      $group: {
+        _id: groupByFormat ? { $dateToString: { format: groupByFormat, date: '$fecha' } } : null,
+        totalVentas: { $sum: 1 },
+        montoTotal: { $sum: '$totalFinal' },
+        costoTotal: { $sum: '$costoVenta' },
+        impuestosTotal: { $sum: '$impuestosVenta' }
+      }
+    },
+    {
+      $project: {
+        totalVentas: 1,
+        montoTotal: 1,
+        costoTotal: 1,
+        impuestosTotal: 1,
+        gananciaNeta: { $subtract: [{ $subtract: ['$montoTotal', '$costoTotal'] }, '$impuestosTotal'] },
+        ticketPromedio: { $divide: ['$montoTotal', { $cond: [{ $eq: ['$totalVentas', 0] }, 1, '$totalVentas'] }] }
+      }
+    },
+    { $sort: { _id: 1 } }
+  ]);
+
+  const paymentMethods = await Sale.aggregate([
+    matchStage,
+    {
+      $group: {
+       _id: '$metodoPago',
+       total: { $sum: '$totalFinal' },
+       count: { $sum: 1 }
+      }
+    }
+  ]);
+
+  return {
+    timeline: mainStats,
+    paymentMethods
+  };
+};
+
+const getReport = async (req, res, period, groupByFormat) => {
+  try {
+    const { date, year, month } = req.query;
+    const { start, end } = getDateRange(period, date, year, month);
+
+    const stats = await buildReportAggregation(start, end, groupByFormat);
+
+    // Sumario total (ya que timeline puede venir separado por dias/horas)
+    let totalVentas = 0;
+    let montoTotal = 0;
+    let costoTotal = 0;
+    let impuestosTotal = 0;
+
+    stats.timeline.forEach(t => {
+      totalVentas += t.totalVentas;
+      montoTotal += t.montoTotal;
+      costoTotal += t.costoTotal;
+      impuestosTotal += t.impuestosTotal || 0;
+    });
+
+    const gananciaNeta = montoTotal - costoTotal - impuestosTotal;
+    const ticketPromedio = totalVentas > 0 ? montoTotal / totalVentas : 0;
+
+    res.json({
+      periodo: { start, end },
+      totales: {
+        totalVentas,
+        montoTotal,
+        costoTotal,
+        impuestosTotal,
+        gananciaNeta,
+        ticketPromedio
+      },
+      ventasPorMetodoPago: stats.paymentMethods,
+      timeline: stats.timeline // ventas por hora/día/mes dependiendo del groupByFormat
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error al generar reporte' });
+  }
+};
+
+// @desc    Reporte Diario
+// @route   GET /api/reports/daily
+const getDailyReport = (req, res) => getReport(req, res, 'daily', '%H'); // Agrupa por hora
+
+// @desc    Reporte Semanal
+// @route   GET /api/reports/weekly
+const getWeeklyReport = (req, res) => getReport(req, res, 'weekly', '%Y-%m-%d'); // Agrupa por dia
+
+// @desc    Reporte Mensual
+// @route   GET /api/reports/monthly
+const getMonthlyReport = (req, res) => getReport(req, res, 'monthly', '%Y-%m-%d'); // Agrupa por dia
+
+// @desc    Reporte Anual
+// @route   GET /api/reports/annual
+const getAnnualReport = (req, res) => getReport(req, res, 'annual', '%Y-%m'); // Agrupa por mes
+
+// @desc    Top Productos Vendidos
+// @route   GET /api/reports/top-products
+const getTopProductsReport = async (req, res) => {
+  try {
+    const { period, date, year, month } = req.query;
+    const { start, end } = getDateRange(period || 'monthly', date, year, month);
+
+    const topProducts = await Sale.aggregate([
+      {
+        $match: {
+          fecha: { $gte: start, $lte: end },
+          estado: 'completada'
+        }
+      },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$items.producto',
+          cantidadVendida: { $sum: '$items.cantidad' },
+          ingresosGenerados: { $sum: '$items.subtotal' }
+        }
+      },
+      { $sort: { cantidadVendida: -1 } },
+      { $limit: 10 },
+      {
+        $lookup: {
+          from: 'products',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'productoInfo'
+        }
+      },
+      { $unwind: '$productoInfo' },
+      {
+        $project: {
+          _id: 1,
+          cantidadVendida: 1,
+          ingresosGenerados: 1,
+          nombre: '$productoInfo.nombre',
+          sku: '$productoInfo.sku',
+          imagen: '$productoInfo.imagen'
+        }
+      }
+    ]);
+
+    res.json(topProducts);
+  } catch (error) {
+    res.status(500).json({ message: 'Error al obtener top productos' });
+  }
+};
+
+// @desc    Resumen general Dashboard
+// @route   GET /api/reports/summary
+const getDashboardSummary = async (req, res) => {
+  try {
+    const todayStart = getArgStartOfDay();
+    
+    const matchStage = {
+      $match: {
+        fecha: { $gte: todayStart },
+        estado: 'completada'
+      }
+    };
+
+    const dailyStats = await Sale.aggregate([
+      matchStage,
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$_id',
+          totalFinal: { $first: '$totalFinal' },
+          impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+          costoVenta: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalVentas: { $sum: 1 },
+          montoTotal: { $sum: '$totalFinal' },
+          costoTotal: { $sum: '$costoVenta' },
+          impuestosTotal: { $sum: '$impuestosVenta' }
+        }
+      }
+    ]);
+
+    const stats = dailyStats[0] || { totalVentas: 0, montoTotal: 0, costoTotal: 0, impuestosTotal: 0 };
+    const gananciaHoy = stats.montoTotal - stats.costoTotal - (stats.impuestosTotal || 0);
+
+    // Obtener productos mas vendidos de hoy
+    const topToday = await Sale.aggregate([
+      matchStage,
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$items.producto',
+          cantidad: { $sum: '$items.cantidad' }
+        }
+      },
+      { $sort: { cantidad: -1 } },
+      { $limit: 5 },
+      {
+        $lookup: {
+          from: 'products',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'producto'
+        }
+      },
+      { $unwind: '$producto' },
+      {
+        $project: {
+          nombre: '$producto.nombre',
+          cantidad: 1
+        }
+      }
+    ]);
+
+    // Ventas por hora
+    const ventasPorHora = await Sale.aggregate([
+      matchStage,
+      {
+        $group: {
+          _id: { $hour: { date: '$fecha', timezone: 'America/Argentina/Buenos_Aires'} },
+          total: { $sum: '$totalFinal' }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    // Datos del mes actual
+    const now = new Date();
+    const [y, m] = now.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).split('-').map(Number);
+    const monthStart = new Date(Date.UTC(y, m - 1, 1, 3, 0, 0, 0));
+
+    const monthlyStats = await Sale.aggregate([
+      {
+        $match: {
+          fecha: { $gte: monthStart },
+          estado: 'completada'
+        }
+      },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$_id',
+          totalFinal: { $first: '$totalFinal' },
+          impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+          costoVenta: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalVentas: { $sum: 1 },
+          montoTotal: { $sum: '$totalFinal' },
+          costoTotal: { $sum: '$costoVenta' },
+          impuestosTotal: { $sum: '$impuestosVenta' }
+        }
+      }
+    ]);
+
+    const mStats = monthlyStats[0] || { totalVentas: 0, montoTotal: 0, costoTotal: 0, impuestosTotal: 0 };
+
+    // Gastos de hoy (se descuentan del ticket de facturacion)
+    const gastosHoyAgg = await Expense.aggregate([
+      { $match: { fecha: { $gte: todayStart } } },
+      { $group: { _id: null, total: { $sum: '$monto' } } }
+    ]);
+    const gastosHoy = gastosHoyAgg[0]?.total || 0;
+
+    res.json({
+      ventasHoy: stats.totalVentas,
+      facturacionHoy: stats.montoTotal,
+      gananciaHoy,
+      impuestosHoy: stats.impuestosTotal || 0,
+      gastosHoy,
+      facturacionNetaHoy: stats.montoTotal - gastosHoy,
+      topProducts: topToday,
+      ventasPorHora,
+      mes: {
+        ventas: mStats.totalVentas,
+        facturacion: mStats.montoTotal,
+        impuestos: mStats.impuestosTotal || 0,
+        ganancia: mStats.montoTotal - mStats.costoTotal - (mStats.impuestosTotal || 0)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error al generar resumen' });
+  }
+};
+
+// @desc    Estadísticas Globales (Stock y Ventas Históricas)
+// @route   GET /api/reports/global-stats
+const getGlobalStats = async (req, res) => {
+  try {
+    // 1. Estadísticas de Productos
+    const totalProducts = await Product.countDocuments({ activo: true });
+    
+    // Valor del Stock (Costo y Venta)
+    const inventoryVal = await Product.aggregate([
+      { $match: { activo: true } },
+      {
+        $group: {
+          _id: null,
+          totalCost: { $sum: { $multiply: ['$stock', '$precioCompra'] } },
+          totalSalesValue: { $sum: { $multiply: ['$stock', '$precioVenta'] } }
+        }
+      }
+    ]);
+
+    // Breakdown por Categoría
+    const categoryBreakdown = await Product.aggregate([
+      { $match: { activo: true } },
+      {
+        $group: {
+          _id: '$categoria',
+          count: { $sum: 1 },
+          stockTotal: { $sum: '$stock' },
+          valorCoste: { $sum: { $multiply: ['$stock', '$precioCompra'] } }
+        }
+      },
+      {
+        $lookup: {
+          from: 'categories',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'categoriaInfo'
+        }
+      },
+      { $unwind: '$categoriaInfo' },
+      {
+        $project: {
+          nombre: '$categoriaInfo.nombre',
+          count: 1,
+          stockTotal: 1,
+          valorCoste: 1
+        }
+      },
+      { $sort: { valorCoste: -1 } }
+    ]);
+
+    // 2. Estadísticas de Ventas Históricas (Solo completadas)
+    const saleStats = await Sale.aggregate([
+      { $match: { estado: 'completada' } },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$_id',
+          totalFinal: { $first: '$totalFinal' },
+          impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+          totalCosto: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          count: { $sum: 1 },
+          billing: { $sum: '$totalFinal' },
+          cost: { $sum: '$totalCosto' },
+          taxes: { $sum: '$impuestosVenta' }
+        }
+      }
+    ]);
+
+    const stats = saleStats[0] || { count: 0, billing: 0, cost: 0, taxes: 0 };
+
+    res.json({
+      productos: {
+        total: totalProducts,
+        valorCoste: inventoryVal[0]?.totalCost || 0,
+        valorVenta: inventoryVal[0]?.totalSalesValue || 0,
+        breakdown: categoryBreakdown
+      },
+      ventas: {
+        totalCount: stats.count,
+        facturacionTotal: stats.billing,
+        impuestosTotal: stats.taxes || 0,
+        gananciaTotal: stats.billing - stats.cost - (stats.taxes || 0)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error al obtener estadísticas globales' });
+  }
+};
+
+// @desc    Estadísticas completas de ventas por producto
+// @route   GET /api/reports/sales-stats
+const getSalesStats = async (req, res) => {
+  try {
+    const productSales = await Sale.aggregate([
+      { $match: { estado: 'completada' } },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$items.producto',
+          cantidadVendida: { $sum: '$items.cantidad' },
+          ingresosGenerados: { $sum: '$items.subtotal' },
+          costoTotal: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } },
+          unidadesVendidas: { $sum: '$items.cantidad' },
+          ingresosNetos: { $sum: '$items.subtotal' }
+        }
+      },
+      {
+        $lookup: {
+          from: 'products',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'productoInfo'
+        }
+      },
+      { $unwind: '$productoInfo' },
+      {
+        $lookup: {
+          from: 'categories',
+          localField: 'productoInfo.categoria',
+          foreignField: '_id',
+          as: 'categoriaInfo'
+        }
+      },
+      { $unwind: '$categoriaInfo' },
+      {
+        $project: {
+          _id: 1,
+          cantidadVendida: 1,
+          ingresosGenerados: 1,
+          costoTotal: 1,
+          unidadesVendidas: 1,
+          ingresosNetos: 1,
+          ganancia: { $subtract: ['$ingresosGenerados', '$costoTotal'] },
+          margen: {
+            $cond: [
+              { $eq: ['$ingresosGenerados', 0] },
+              0,
+              { $multiply: [{ $divide: [{ $subtract: ['$ingresosGenerados', '$costoTotal'] }, '$ingresosGenerados'] }, 100] }
+            ]
+          },
+          nombre: '$productoInfo.nombre',
+          sku: '$productoInfo.sku',
+          imagen: '$productoInfo.imagen',
+          precioVentaActual: '$productoInfo.precioVenta',
+          precioCompraActual: '$productoInfo.precioCompra',
+          stockActual: '$productoInfo.stock',
+          categoria: '$categoriaInfo.nombre',
+          activo: '$productoInfo.activo'
+        }
+      },
+      { $sort: { cantidadVendida: -1 } }
+    ]);
+
+    const totalSummary = await Sale.aggregate([
+      { $match: { estado: 'completada' } },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$_id',
+          totalFinal: { $first: '$totalFinal' },
+          impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+          costoVenta: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalVentas: { $sum: 1 },
+          montoTotal: { $sum: '$totalFinal' },
+          costoTotal: { $sum: '$costoVenta' },
+          impuestosTotal: { $sum: '$impuestosVenta' }
+        }
+      }
+    ]);
+
+    const summary = totalSummary[0] || { totalVentas: 0, montoTotal: 0, costoTotal: 0, impuestosTotal: 0 };
+    const productosConVentas = productSales.filter(p => p.cantidadVendida > 0).length;
+
+    res.json({
+      summary: {
+        totalVentas: summary.totalVentas,
+        facturacionTotal: summary.montoTotal,
+        costoTotal: summary.costoTotal,
+        impuestosTotal: summary.impuestosTotal || 0,
+        gananciaTotal: summary.montoTotal - summary.costoTotal - (summary.impuestosTotal || 0),
+        margenGeneral: summary.montoTotal > 0 ? ((summary.montoTotal - summary.costoTotal - (summary.impuestosTotal || 0)) / summary.montoTotal * 100) : 0,
+        totalProductos: productSales.length,
+        productosConVentas
+      },
+      products: productSales
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error al obtener estadísticas de ventas' });
+  }
+};
+
+// @desc    Data para el heatmap de ventas (facturación y ganancia diaria)
+// @route   GET /api/reports/sales-heatmap
+const getSalesHeatmap = async (req, res) => {
+  try {
+    const months = req.query.months || 6;
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setMonth(startDate.getMonth() - months);
+    
+    // Ajustar al inicio del día en Arg (UTC-3)
+    const [y, m, d] = startDate.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).split('-').map(Number);
+    const startDateArg = new Date(Date.UTC(y, m - 1, d, 3, 0, 0, 0));
+
+    const heatmapData = await Sale.aggregate([
+      {
+        $match: {
+          fecha: { $gte: startDateArg, $lte: endDate },
+          estado: 'completada'
+        }
+      },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$_id',
+          totalFinal: { $first: '$totalFinal' },
+          fecha: { $first: '$fecha' },
+          metodoPago: { $first: '$metodoPago' },
+          impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+          costoVenta: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+        }
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$fecha", timezone: "America/Argentina/Buenos_Aires" } },
+          total: { $sum: '$totalFinal' },
+          costo: { $sum: '$costoVenta' },
+          impuestos: { $sum: '$impuestosVenta' },
+          efectivo: { $sum: { $cond: [{ $eq: ['$metodoPago', 'efectivo'] }, '$totalFinal', 0] } },
+          tarjeta: { $sum: { $cond: [{ $eq: ['$metodoPago', 'tarjeta'] }, '$totalFinal', 0] } },
+          tarjetaDebito: { $sum: { $cond: [{ $eq: ['$metodoPago', 'tarjeta_debito'] }, '$totalFinal', 0] } },
+          transferencia: { $sum: { $cond: [{ $eq: ['$metodoPago', 'transferencia'] }, '$totalFinal', 0] } }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          date: '$_id',
+          total: 1,
+          profit: { $subtract: [{ $subtract: ['$total', '$costo'] }, '$impuestos'] },
+          impuestos: 1,
+          efectivo: 1,
+          tarjeta: 1,
+          tarjetaDebito: 1,
+          transferencia: 1
+        }
+      },
+      { $sort: { date: 1 } }
+    ]);
+
+    res.json(heatmapData);
+  } catch (error) {
+    res.status(500).json({ message: 'Error al obtener datos del heatmap' });
+  }
+};
+
+// @desc    Cierre de caja del día (ventas por método de pago + gastos)
+// @route   GET /api/reports/cash-close
+const getCashClose = async (req, res) => {
+  try {
+    const { date } = req.query;
+    const start = date
+      ? new Date(Date.UTC(...date.split('-').map(Number), 3, 0, 0, 0))
+      : getArgStartOfDay();
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
+
+    const ventas = await Sale.aggregate([
+      { $match: { fecha: { $gte: start, $lte: end }, estado: 'completada' } },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$_id',
+          totalFinal: { $first: '$totalFinal' },
+          metodoPago: { $first: '$metodoPago' },
+          montoPagado: { $first: '$montoPagado' },
+          vuelto: { $first: '$vuelto' },
+          impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+          costoVenta: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalVentas: { $sum: 1 },
+          montoTotal: { $sum: '$totalFinal' },
+          costoTotal: { $sum: '$costoVenta' },
+          impuestosTotal: { $sum: '$impuestosVenta' },
+          efectivo: { $sum: { $cond: [{ $eq: ['$metodoPago', 'efectivo'] }, '$totalFinal', 0] } },
+          tarjeta: { $sum: { $cond: [{ $eq: ['$metodoPago', 'tarjeta'] }, '$totalFinal', 0] } },
+          tarjeta_debito: { $sum: { $cond: [{ $eq: ['$metodoPago', 'tarjeta_debito'] }, '$totalFinal', 0] } },
+          transferencia: { $sum: { $cond: [{ $eq: ['$metodoPago', 'transferencia'] }, '$totalFinal', 0] } },
+          efectivoPagado: { $sum: { $cond: [{ $eq: ['$metodoPago', 'efectivo'] }, { $ifNull: ['$montoPagado', '$totalFinal'] }, 0] } },
+          efectivoVuelto: { $sum: { $cond: [{ $eq: ['$metodoPago', 'efectivo'] }, { $ifNull: ['$vuelto', 0] }, 0] } }
+        }
+      }
+    ]);
+
+    const v = ventas[0] || { totalVentas: 0, montoTotal: 0, costoTotal: 0, impuestosTotal: 0, efectivo: 0, tarjeta: 0, tarjeta_debito: 0, transferencia: 0, efectivoPagado: 0, efectivoVuelto: 0 };
+
+    const gastos = await Expense.aggregate([
+      { $match: { fecha: { $gte: start, $lte: end } } },
+      {
+        $group: {
+          _id: '$categoria',
+          total: { $sum: '$monto' },
+          cantidad: { $sum: 1 }
+        }
+      },
+      { $sort: { total: -1 } }
+    ]);
+
+    const totalGastos = gastos.reduce((acc, g) => acc + g.total, 0);
+    const gananciaBruta = v.montoTotal - v.costoTotal;
+    const balanceNeto = gananciaBruta - (v.impuestosTotal || 0) - totalGastos;
+    const efectivoEnCaja = v.efectivoPagado - v.efectivoVuelto;
+
+    res.json({
+      fecha: start,
+      ventas: {
+        total: v.totalVentas,
+        montoTotal: v.montoTotal,
+        costoTotal: v.costoTotal,
+        efectivo: v.efectivo,
+        tarjeta: v.tarjeta,
+        tarjeta_debito: v.tarjeta_debito,
+        transferencia: v.transferencia,
+        efectivoEnCaja,
+      },
+      gastos: {
+        total: totalGastos,
+        porCategoria: gastos,
+      },
+      gananciaBruta,
+      impuestos: v.impuestosTotal || 0,
+      balanceNeto,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error al generar cierre de caja' });
+  }
+};
+
+// @desc    Flujo de caja mensual (ventas - gastos por día)
+// @route   GET /api/reports/cash-flow
+const getCashFlow = async (req, res) => {
+  try {
+    const { year, month } = req.query;
+    const now = new Date();
+    const y = year ? parseInt(year) : parseInt(now.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).split('-')[0]);
+    const m = month ? parseInt(month) - 1 : parseInt(now.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).split('-')[1]) - 1;
+
+    const start = new Date(Date.UTC(y, m, 1, 3, 0, 0, 0));
+    const end = new Date(Date.UTC(y, m + 1, 0, 23, 59, 59, 999) + 3 * 3600 * 1000);
+
+    const ventasPorDia = await Sale.aggregate([
+      { $match: { fecha: { $gte: start, $lte: end }, estado: 'completada' } },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: '$_id',
+          fecha: { $first: '$fecha' },
+          totalFinal: { $first: '$totalFinal' },
+          metodoPago: { $first: '$metodoPago' },
+          impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+          costoVenta: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+        }
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$fecha', timezone: 'America/Argentina/Buenos_Aires' } },
+          ventas: { $sum: 1 },
+          ingresos: { $sum: '$totalFinal' },
+          costoVentas: { $sum: '$costoVenta' },
+          impuestos: { $sum: '$impuestosVenta' },
+          efectivo: { $sum: { $cond: [{ $eq: ['$metodoPago', 'efectivo'] }, '$totalFinal', 0] } },
+          tarjeta: { $sum: { $cond: [{ $eq: ['$metodoPago', 'tarjeta'] }, '$totalFinal', 0] } },
+          tarjeta_debito: { $sum: { $cond: [{ $eq: ['$metodoPago', 'tarjeta_debito'] }, '$totalFinal', 0] } },
+          transferencia: { $sum: { $cond: [{ $eq: ['$metodoPago', 'transferencia'] }, '$totalFinal', 0] } }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    const gastosPorDia = await Expense.aggregate([
+      { $match: { fecha: { $gte: start, $lte: end } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$fecha', timezone: 'America/Argentina/Buenos_Aires' } },
+          gastos: { $sum: '$monto' },
+          cantidad: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const gastosMap = {};
+    gastosPorDia.forEach((g) => { gastosMap[g._id] = g.gastos; });
+
+    const daysInMonth = new Date(y, m + 1, 0).getDate();
+    const dias = [];
+    let totalIngresos = 0;
+    let totalGastos = 0;
+    let totalVentas = 0;
+    let totalImpuestos = 0;
+
+    for (let d = 1; d <= daysInMonth; d++) {
+      const key = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      const venta = ventasPorDia.find((v) => v._id === key);
+      const gasto = gastosMap[key] || 0;
+      const ingresos = venta?.ingresos || 0;
+      const costoVentas = venta?.costoVentas || 0;
+      const impuestos = venta?.impuestos || 0;
+      const ganancia = ingresos - costoVentas - impuestos;
+      const balance = ganancia - gasto;
+
+      totalIngresos += ingresos;
+      totalGastos += gasto;
+      totalVentas += venta?.ventas || 0;
+      totalImpuestos += impuestos;
+
+      dias.push({
+        fecha: key,
+        ventas: venta?.ventas || 0,
+        ingresos,
+        costoVentas,
+        impuestos,
+        ganancia,
+        gastos: gasto,
+        balance,
+        efectivo: venta?.efectivo || 0,
+        tarjeta: venta?.tarjeta || 0,
+        tarjeta_debito: venta?.tarjeta_debito || 0,
+        transferencia: venta?.transferencia || 0,
+      });
+    }
+
+    res.json({
+      periodo: { year: y, month: m + 1, inicio: start, fin: end },
+      totales: {
+        ingresos: totalIngresos,
+        gastos: totalGastos,
+        impuestos: totalImpuestos,
+        ganancia: totalIngresos - totalGastos - totalImpuestos,
+        ventas: totalVentas,
+      },
+      dias,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error al generar flujo de caja' });
+  }
+};
+
+// @desc    Estadísticas extra para el Dashboard (histórico, gastos, reposición)
+// @route   GET /api/reports/dashboard-extra
+const getDashboardExtra = async (req, res) => {
+  try {
+    const now = new Date();
+    const argStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+    const [currentY, currentM] = argStr.split('-').map(Number);
+
+    const start12 = new Date(Date.UTC(currentY, currentM - 13, 1, 3, 0, 0, 0));
+
+    const [monthlySales, monthlyExpenses] = await Promise.all([
+      Sale.aggregate([
+        { $match: { fecha: { $gte: start12 }, estado: 'completada' } },
+        { $unwind: '$items' },
+        {
+          $group: {
+            _id: '$_id',
+            totalFinal: { $first: '$totalFinal' },
+            fecha: { $first: '$fecha' },
+            impuestosVenta: { $first: { $ifNull: ['$impuestosPago', 0] } },
+            costoVenta: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } }
+          }
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m', date: '$fecha', timezone: 'America/Argentina/Buenos_Aires' } },
+            facturacion: { $sum: '$totalFinal' },
+            costoVentas: { $sum: '$costoVenta' },
+            impuestos: { $sum: '$impuestosVenta' },
+            tickets: { $sum: 1 }
+          }
+        }
+      ]),
+      Expense.aggregate([
+        { $match: { fecha: { $gte: start12 } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m', date: '$fecha', timezone: 'America/Argentina/Buenos_Aires' } },
+            gastos: { $sum: '$monto' }
+          }
+        }
+      ])
+    ]);
+
+    const monthLabels = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+    const historico = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(currentY, currentM - 1 - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const sale = monthlySales.find(s => s._id === key) || { facturacion: 0, costoVentas: 0, impuestos: 0, tickets: 0 };
+      const exp = monthlyExpenses.find(e => e._id === key) || { gastos: 0 };
+      historico.push({
+        mes: key,
+        nombre: monthLabels[d.getMonth()] + ' ' + String(d.getFullYear()).slice(2),
+        facturacion: sale.facturacion,
+        costoVentas: sale.costoVentas,
+        impuestos: sale.impuestos || 0,
+        gananciaBruta: sale.facturacion - sale.costoVentas,
+        gastos: exp.gastos,
+        gananciaNeta: sale.facturacion - sale.costoVentas - (sale.impuestos || 0) - exp.gastos,
+        tickets: sale.tickets
+      });
+    }
+
+    const monthStart = new Date(Date.UTC(currentY, currentM - 1, 1, 3, 0, 0, 0));
+    const currentMonthExpenses = await Expense.aggregate([
+      { $match: { fecha: { $gte: monthStart } } },
+      {
+        $group: {
+          _id: '$categoria',
+          total: { $sum: '$monto' },
+          cantidad: { $sum: 1 }
+        }
+      },
+      { $sort: { total: -1 } }
+    ]);
+
+    const lowStockProducts = await Product.find({
+      activo: true,
+      $expr: { $lte: ['$stock', '$stockMinimo'] }
+    }).select('nombre stock stockMinimo precioCompra unidadMedida')
+      .populate('categoria', 'nombre');
+
+    const restockingCost = lowStockProducts.reduce((acc, p) => {
+      const needed = Math.max(0, p.stockMinimo - p.stock);
+      return acc + (needed * p.precioCompra);
+    }, 0);
+
+    const dayOfMonth = parseInt(argStr.split('-')[2]);
+    const daysInMonth = new Date(currentY, currentM, 0).getDate();
+    const currentMonthData = historico[historico.length - 1] || { facturacion: 0, gastos: 0, gananciaBruta: 0, gananciaNeta: 0 };
+    const prevMonthData = historico.length >= 2 ? historico[historico.length - 2] : { facturacion: 0 };
+    const avgDailyBilling = dayOfMonth > 0 ? currentMonthData.facturacion / dayOfMonth : 0;
+    const projectedBilling = avgDailyBilling * daysInMonth;
+
+    res.json({
+      historicoMensual: historico,
+      mesActual: {
+        gastosPorCategoria: currentMonthExpenses,
+        gastosTotal: currentMonthExpenses.reduce((acc, e) => acc + e.total, 0),
+        diaDelMes: dayOfMonth,
+        diasEnMes: daysInMonth,
+        facturacion: currentMonthData.facturacion,
+        gananciaBruta: currentMonthData.gananciaBruta,
+        impuestos: currentMonthData.impuestos || 0,
+        gananciaNeta: currentMonthData.gananciaNeta,
+        promedioDiario: avgDailyBilling,
+        proyeccionFinMes: projectedBilling,
+        facturacionMesAnterior: prevMonthData.facturacion,
+      },
+      reposicionMercaderia: {
+        productosNecesitan: lowStockProducts.length,
+        productos: lowStockProducts.slice(0, 10),
+        costoTotal: restockingCost,
+      }
+    });
+  } catch (error) {
+    console.error('Error dashboard extra:', error);
+    res.status(500).json({ message: 'Error al obtener estadísticas del dashboard' });
+  }
+};
+
+// @desc    Análisis de productos: cuáles conviene vender más según costo y ganancia
+// @route   GET /api/reports/product-analysis
+const getProductAnalysis = async (req, res) => {
+  try {
+    const { dias } = req.query;
+    let desde = null;
+    if (dias && parseInt(dias) > 0) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - parseInt(dias));
+      const [y, m, d] = cutoff.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).split('-').map(Number);
+      desde = new Date(Date.UTC(y, m - 1, d, 3, 0, 0, 0));
+    }
+
+    const match = { estado: 'completada' };
+    if (desde) match.fecha = { $gte: desde };
+
+    const salesAgg = await Sale.aggregate([
+      { $match: match },
+      { $unwind: '$items' },
+      {
+        $group: {
+          _id: { producto: '$items.producto', venta: '$_id' },
+          subtotal: { $sum: '$items.subtotal' },
+          costo: { $sum: { $multiply: ['$items.precioCompraHisto', '$items.cantidad'] } },
+          unidades: { $sum: '$items.cantidad' }
+        }
+      },
+      {
+        $group: {
+          _id: '$_id.producto',
+          tickets: { $sum: 1 },
+          unidades: { $sum: '$unidades' },
+          ingresos: { $sum: '$subtotal' },
+          costoHistorico: { $sum: '$costo' }
+        }
+      }
+    ]);
+
+    const products = await Product.find({})
+      .populate('categoria', 'nombre')
+      .select('nombre sku categoria precioCompra precioVenta stock stockMinimo activo esGenerico unidadMedida');
+
+    const aggMap = new Map(salesAgg.map(o => [String(o._id), o]));
+
+    const result = products.map(p => {
+      const agg = aggMap.get(String(p._id)) || { unidades: 0, ingresos: 0, costoHistorico: 0, tickets: 0 };
+      const tieneVentas = agg.ingresos > 0;
+
+      // Todas las ventas son por unidad: no hay fraccionamiento por peso
+      const gananciaUnitaria = p.precioVenta - p.precioCompra;
+      const margenPct = p.precioVenta > 0 ? (gananciaUnitaria / p.precioVenta) * 100 : 0;
+      const roiPct = p.precioCompra > 0 ? (gananciaUnitaria / p.precioCompra) * 100 : 0;
+      const volumen = agg.unidades;
+
+      const gananciaHistorica = agg.ingresos - agg.costoHistorico;
+      const margenHistoricoPct = agg.ingresos > 0 ? (gananciaHistorica / agg.ingresos) * 100 : margenPct;
+      // Bonus por rotación: los que ya se venden reciben un pequeño refuerzo en el score
+      const velocityBonus = Math.min(volumen, 20);
+      const score = Math.round(roiPct * 0.7 + margenPct * 0.3 + (tieneVentas ? velocityBonus : 0));
+
+      return {
+        id: p._id,
+        nombre: p.nombre,
+        sku: p.sku,
+        categoria: p.categoria?.nombre || 'Sin categoría',
+        activo: p.activo,
+        esGenerico: p.esGenerico,
+        unidadMedida: p.unidadMedida || 'unidad',
+        precioCompra: p.precioCompra,
+        precioVenta: p.precioVenta,
+        stock: p.stock,
+        stockMinimo: p.stockMinimo,
+        gananciaUnitaria: +gananciaUnitaria.toFixed(2),
+        margenPct: +margenPct.toFixed(2),
+        roiPct: +roiPct.toFixed(2),
+        unidadesVendidas: agg.unidades,
+        volumen: +volumen.toFixed(2),
+        tickets: agg.tickets,
+        ingresos: agg.ingresos,
+        costoHistorico: agg.costoHistorico,
+        gananciaHistorica: +gananciaHistorica.toFixed(2),
+        margenHistoricoPct: +margenHistoricoPct.toFixed(2),
+        tieneVentas,
+        score
+      };
+    });
+
+    const conVentas = result.filter(p => p.tieneVentas);
+    const ingresosPeriodo = result.reduce((a, p) => a + p.ingresos, 0);
+    const costoPeriodo = result.reduce((a, p) => a + p.costoHistorico, 0);
+    const gananciaPeriodo = ingresosPeriodo - costoPeriodo;
+
+    res.json({
+      periodo: { dias: desde ? parseInt(dias) : null },
+      summary: {
+        totalProductos: result.length,
+        conVentas: conVentas.length,
+        ingresosPeriodo,
+        costoPeriodo: +costoPeriodo.toFixed(2),
+        gananciaPeriodo: +gananciaPeriodo.toFixed(2),
+        margenPromedioPct: ingresosPeriodo > 0 ? +(((ingresosPeriodo - costoPeriodo) / ingresosPeriodo) * 100).toFixed(2) : 0
+      },
+      products: result
+    });
+  } catch (error) {
+    console.error('Error product-analysis:', error);
+    res.status(500).json({ message: 'Error al generar el análisis de productos' });
+  }
+};
+
+// @desc    Ultimas ventas del dashboard (detalle, cliente, costo y ganancia)
+// @route   GET /api/reports/latest-sales
+// @access  Private
+const getLatestSales = async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 5, 20);
+
+    const sales = await Sale.find({ estado: 'completada' })
+      .sort({ fecha: -1 })
+      .limit(limit)
+      .populate('cliente', 'nombre telefono esAfiliado')
+      .populate('items.producto', 'nombre')
+      .lean();
+
+    const ventas = (sales || []).map(v => {
+      const items = (v.items || []).map(i => ({
+        nombre: (i.producto && i.producto.nombre) || i.nombre || 'Producto',
+        cantidad: i.cantidad || 0,
+        subtotal: i.subtotal || 0,
+      }));
+
+      const costo = (v.items || []).reduce(
+        (acc, i) => acc + (i.precioCompraHisto || 0) * (i.cantidad || 0), 0
+      );
+      const impuestos = v.impuestosPago || 0;
+
+      return {
+        _id: v._id,
+        numeroTicket: v.numeroTicket,
+        fecha: v.fecha,
+        metodoPago: v.metodoPago,
+        totalFinal: v.totalFinal || 0,
+        costo: Math.round(costo),
+        impuestos: Math.round(impuestos),
+        ganancia: Math.round((v.totalFinal || 0) - costo - impuestos),
+        puntosGanados: v.puntosGanados || 0,
+        cliente: v.cliente && v.cliente._id
+          ? {
+              _id: v.cliente._id,
+              nombre: v.cliente.nombre,
+              telefono: v.cliente.telefono,
+              esAfiliado: v.cliente.esAfiliado || false,
+            }
+          : null,
+        items,
+      };
+    });
+
+    res.json(ventas);
+  } catch (error) {
+    res.status(500).json({ message: 'Error al obtener las ultimas ventas' });
+  }
+};
+
+// @desc    Impuestos/comisiones descontados por medio de pago (IIBB + Mercado Pago)
+// @route   GET /api/reports/taxes
+// @access  Private
+const getTaxes = async (req, res) => {
+  try {
+    const { date, year, month, period = 'monthly' } = req.query;
+    const p = ['daily', 'weekly', 'monthly', 'annual'].includes(period) ? period : 'monthly';
+    const { start, end } = getDateRange(p, date, year, month);
+
+    const match = { $match: { fecha: { $gte: start, $lte: end }, estado: 'completada' } };
+
+    const porMetodo = await Sale.aggregate([
+      match,
+      {
+        $group: {
+          _id: '$metodoPago',
+          facturacion: { $sum: '$totalFinal' },
+          retencionIIBB: { $sum: { $ifNull: ['$retencionIIBB', 0] } },
+          comisionMP: { $sum: { $ifNull: ['$comisionMP', 0] } },
+          impuestosTotal: { $sum: { $ifNull: ['$impuestosPago', 0] } },
+          ventas: { $sum: 1 }
+        }
+      },
+      { $sort: { impuestosTotal: -1 } }
+    ]);
+
+    const porDia = await Sale.aggregate([
+      match,
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$fecha', timezone: 'America/Argentina/Buenos_Aires' } },
+          facturacion: { $sum: '$totalFinal' },
+          retencionIIBB: { $sum: { $ifNull: ['$retencionIIBB', 0] } },
+          comisionMP: { $sum: { $ifNull: ['$comisionMP', 0] } },
+          impuestosTotal: { $sum: { $ifNull: ['$impuestosPago', 0] } },
+          ventas: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+    // Otros impuestos = total - IIBB - MP (captura los impuestos personalizados)
+    const conOtros = (fila) => ({
+      ...fila,
+      otrosImpuestos: round2((fila.impuestosTotal || 0) - (fila.retencionIIBB || 0) - (fila.comisionMP || 0)),
+    });
+    const porMetodoOut = porMetodo.map(conOtros);
+    const porDiaOut = porDia.map(conOtros);
+
+    const totales = porMetodoOut.reduce((acc, m) => ({
+      facturacion: acc.facturacion + m.facturacion,
+      retencionIIBB: acc.retencionIIBB + m.retencionIIBB,
+      comisionMP: acc.comisionMP + m.comisionMP,
+      otrosImpuestos: acc.otrosImpuestos + m.otrosImpuestos,
+      impuestosTotal: acc.impuestosTotal + m.impuestosTotal,
+      ventas: acc.ventas + m.ventas
+    }), { facturacion: 0, retencionIIBB: 0, comisionMP: 0, otrosImpuestos: 0, impuestosTotal: 0, ventas: 0 });
+
+    totales.facturacion = round2(totales.facturacion);
+    totales.retencionIIBB = round2(totales.retencionIIBB);
+    totales.comisionMP = round2(totales.comisionMP);
+    totales.otrosImpuestos = round2(totales.otrosImpuestos);
+    totales.impuestosTotal = round2(totales.impuestosTotal);
+
+    res.json({
+      periodo: { start, end, tipo: p },
+      totales,
+      porMetodo: porMetodoOut,
+      porDia: porDiaOut
+    });
+  } catch (error) {
+    console.error('Error taxes:', error);
+    res.status(500).json({ message: 'Error al obtener los impuestos de pago' });
+  }
+};
+
+module.exports = {
+  getDailyReport,
+  getWeeklyReport,
+  getMonthlyReport,
+  getAnnualReport,
+  getTopProductsReport,
+  getDashboardSummary,
+  getGlobalStats,
+  getSalesStats,
+  getSalesHeatmap,
+  getCashClose,
+  getCashFlow,
+  getDashboardExtra,
+  getProductAnalysis,
+  getLatestSales,
+  getTaxes,
+};
