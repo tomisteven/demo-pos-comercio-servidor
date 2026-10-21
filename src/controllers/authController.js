@@ -22,6 +22,7 @@ const loginUser = async (req, res) => {
       res.status(401).json({ message: 'Email o contraseña inválidos o usuario inactivo' });
     }
   } catch (error) {
+    console.error('Error en loginUser:', error.message);
     res.status(500).json({ message: 'Error del servidor' });
   }
 };
