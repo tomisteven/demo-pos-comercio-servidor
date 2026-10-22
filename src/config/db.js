@@ -8,8 +8,20 @@ let cached = null;
 const connectDB = async () => {
   if (cached) return cached;
 
+  const uri = process.env.MONGODB_URI;
+
+  // Diagnóstico explícito: si la env var no llegó, lo vemos en los logs
+  // en vez de quedarnos con el "buffering timed out" genérico.
+  if (!uri) {
+    console.error('Error de conexión a MongoDB: MONGODB_URI no está definida en el entorno');
+    throw new Error('MONGODB_URI no está definida');
+  }
+
+  const uriRedacted = uri.replace(/:\/\/([^:]+):[^@]+@/, '://$1:****@');
+  console.log(`Conectando a MongoDB (${uriRedacted.slice(0, 90)}...)`);
+
   cached = mongoose
-    .connect(process.env.MONGODB_URI, {
+    .connect(uri, {
       // < bufferTimeoutMS (10s): así el error real de conexión aparece en los
       // logs antes del "findOne() buffering timed out" genérico.
       serverSelectionTimeoutMS: 8000,

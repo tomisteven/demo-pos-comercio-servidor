@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ override: false });
 const dns = require('dns');
 const express = require('express');
 const cors = require('cors');
@@ -130,6 +130,27 @@ app.use('/api/system-config', systemConfigRoutes);
 
 app.get('/', (req, res) => {
   res.send('API del Kiosco funcionando...');
+});
+
+// Health check: permite ver desde el navegador si el server y Mongo están OK.
+// NO expone la URI ni credenciales, solo si la variable está presente.
+app.get('/api/health', async (req, res) => {
+  const mongoUriSet = !!process.env.MONGODB_URI;
+  let mongo = 'not-connected';
+  try {
+    await connectDB();
+    mongo = 'connected';
+  } catch (e) {
+    mongo = `error: ${e.message}`;
+  }
+  res.json({
+    ok: mongo === 'connected',
+    mongo,
+    mongoUriSet,
+    dnsForced: !process.env.VERCEL,
+    env: process.env.NODE_ENV || 'development',
+    ts: new Date().toISOString(),
+  });
 });
 
 // Middlewares de Error
