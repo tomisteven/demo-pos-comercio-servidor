@@ -30,6 +30,22 @@ const productSchema = new mongoose.Schema(
       required: true,
       min: 0,
     },
+    // Alimentos fraccionados: además del precio de venta principal pueden
+    // tener precio por fracción y precio de bolsa cerrada (para etiquetas).
+    esFraccionado: {
+      type: Boolean,
+      default: false,
+    },
+    precioFraccionado: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
+    precioBolsaCerrada: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
     stock: {
       type: Number,
       required: true,

@@ -129,6 +129,7 @@ const createProduct = async (req, res) => {
       nombre, descripcion, sku, categoria, precioCompra, precioVenta,
       stock, stockMinimo, unidadMedida, proveedor, imagen,
       esGenerico, notasIA, codigoBarras, mostrarEnCatalogo,
+      esFraccionado, precioFraccionado, precioBolsaCerrada,
     } = req.body;
 
     let finalSku = sku;
@@ -154,6 +155,9 @@ const createProduct = async (req, res) => {
       stock: stock || 0, stockMinimo, unidadMedida, proveedor, imagen,
       esGenerico, notasIA, codigoBarras: finalCodigoBarras,
       mostrarEnCatalogo: mostrarEnCatalogo !== undefined ? mostrarEnCatalogo : true,
+      esFraccionado: !!esFraccionado,
+      precioFraccionado: Number(precioFraccionado) || 0,
+      precioBolsaCerrada: Number(precioBolsaCerrada) || 0,
       sku: finalSku,
     };
 
@@ -191,6 +195,9 @@ const updateProduct = async (req, res) => {
       if (req.body.categoria) product.categoria = req.body.categoria;
       if (req.body.precioCompra !== undefined) product.precioCompra = req.body.precioCompra;
       if (req.body.precioVenta !== undefined) product.precioVenta = req.body.precioVenta;
+      if (req.body.esFraccionado !== undefined) product.esFraccionado = !!req.body.esFraccionado;
+      if (req.body.precioFraccionado !== undefined) product.precioFraccionado = Number(req.body.precioFraccionado) || 0;
+      if (req.body.precioBolsaCerrada !== undefined) product.precioBolsaCerrada = Number(req.body.precioBolsaCerrada) || 0;
       if (req.body.stockMinimo !== undefined) product.stockMinimo = req.body.stockMinimo;
       product.unidadMedida = req.body.unidadMedida || product.unidadMedida;
       product.proveedor = req.body.proveedor || product.proveedor;
