@@ -40,11 +40,14 @@ const systemConfigRoutes = require('./src/routes/systemConfigRoutes');
 
 // Conectar a Base de Datos
 // En serverless (Vercel) la conexión se cachea y reutiliza entre invocaciones.
+// Aun así, NO alcanza con dispararla al importar (el request puede llegar
+// antes de que termine). El middleware `ensureDB` la asegura por request.
 connectDB().catch((err) => {
   console.error('No se pudo conectar a MongoDB:', err.message);
   // En local cortamos ante un fallo de conexión; en Vercel no (mataría la función)
   if (require.main === module) process.exit(1);
 });
+const { ensureDB } = connectDB;
 
 const app = express();
 
@@ -102,6 +105,9 @@ app.use(express.json({ limit: '10mb' })); // Para aceptar imágenes base64 si es
 if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'));
 }
+
+// Asegura la conexión a Mongo antes de cualquier ruta /api (crítico en Vercel)
+app.use('/api', ensureDB);
 
 // Rutas Base
 app.use('/api/auth', authRoutes);
