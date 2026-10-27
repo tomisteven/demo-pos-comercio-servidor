@@ -36,6 +36,18 @@ const systemConfigSchema = new mongoose.Schema({
   catalogoTextoEnvio: { type: String, default: 'Coordinamos el envio por WhatsApp', trim: true },
   catalogoTextoPago: { type: String, default: 'Efectivo, transferencia y tarjetas', trim: true },
 
+  // Paleta visual del catálogo público
+  catalogoColorAcento: { type: String, default: '#f97316', trim: true },
+  catalogoColorFondo: { type: String, default: '#0f0f0f', trim: true },
+  catalogoColorSuperficie: { type: String, default: '#1a1a1a', trim: true },
+  // Roles de texto (los títulos usan catalogoColorTexto)
+  catalogoColorTexto: { type: String, default: '#ffffff', trim: true },
+  catalogoColorProducto: { type: String, default: '#ffffff', trim: true },
+  catalogoColorSubtitulo: { type: String, default: '#a3a3a3', trim: true },
+  catalogoColorDescripcion: { type: String, default: '#a3a3a3', trim: true },
+  catalogoColorCategoria: { type: String, default: '#a3a3a3', trim: true },
+  catalogoColorPrecio: { type: String, default: '#ffffff', trim: true },
+
   // Footer del catálogo público (datos de contacto, redes y textos)
   footerUbicacion: { type: String, default: 'Av. Siempre Viva 742, Buenos Aires, Argentina', trim: true },
   footerTelefono: { type: String, default: '+54 11 5555-1234', trim: true },

@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
 const Sale = require('../models/Sale');
@@ -444,6 +445,30 @@ const getPublicCatalog = async (req, res) => {
   }
 };
 
+// @desc    Ficha pública de un producto (para el QR de la etiqueta)
+// @route   GET /api/products/public/:id
+// @access  Público
+const getPublicProduct = async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ message: 'Producto no encontrado' });
+    }
+    const product = await Product.findOne({
+      _id: req.params.id,
+      activo: true,
+      mostrarEnCatalogo: { $ne: false },
+    })
+      .populate('categoria', 'nombre color')
+      .select('nombre descripcion imagen sku categoria precioVenta precioFraccionado precioBolsaCerrada esFraccionado unidadMedida stock updatedAt');
+
+    if (!product) return res.status(404).json({ message: 'Producto no encontrado' });
+    res.set('Cache-Control', 'no-store');
+    res.json(product);
+  } catch (error) {
+    res.status(500).json({ message: 'Error al obtener el producto' });
+  }
+};
+
 module.exports = {
   getProducts,
   getProductById,
@@ -454,5 +479,6 @@ module.exports = {
   getLowStockProducts,
   bulkAction,
   getProductsWithoutMovement,
-  getPublicCatalog
+  getPublicCatalog,
+  getPublicProduct
 };

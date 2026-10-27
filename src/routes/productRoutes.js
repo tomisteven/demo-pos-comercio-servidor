@@ -11,11 +11,15 @@ const {
   bulkAction,
   getProductsWithoutMovement,
   getPublicCatalog,
+  getPublicProduct,
 } = require('../controllers/productController');
 const { protect, admin } = require('../middlewares/auth');
 
 router.route('/public/catalog')
   .get(getPublicCatalog);
+
+router.route('/public/:id')
+  .get(getPublicProduct);
 
 router.route('/low-stock')
   .get(protect, getLowStockProducts);

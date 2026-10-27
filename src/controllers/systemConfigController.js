@@ -18,6 +18,15 @@ const serialize = (cfg) => ({
   catalogoSubtitulo: cfg.catalogoSubtitulo,
   catalogoTextoEnvio: cfg.catalogoTextoEnvio,
   catalogoTextoPago: cfg.catalogoTextoPago,
+  catalogoColorAcento: cfg.catalogoColorAcento,
+  catalogoColorFondo: cfg.catalogoColorFondo,
+  catalogoColorSuperficie: cfg.catalogoColorSuperficie,
+  catalogoColorTexto: cfg.catalogoColorTexto,
+  catalogoColorProducto: cfg.catalogoColorProducto,
+  catalogoColorSubtitulo: cfg.catalogoColorSubtitulo,
+  catalogoColorDescripcion: cfg.catalogoColorDescripcion,
+  catalogoColorCategoria: cfg.catalogoColorCategoria,
+  catalogoColorPrecio: cfg.catalogoColorPrecio,
   ...FOOTER_KEYS.reduce((acc, k) => { acc[k] = cfg[k]; return acc; }, {}),
   impuestos: (cfg.impuestos || []).map((i) => ({
     _id: i._id,
@@ -34,6 +43,15 @@ const serializePublico = (cfg) => ({
   catalogoSubtitulo: cfg.catalogoSubtitulo,
   catalogoTextoEnvio: cfg.catalogoTextoEnvio,
   catalogoTextoPago: cfg.catalogoTextoPago,
+  catalogoColorAcento: cfg.catalogoColorAcento,
+  catalogoColorFondo: cfg.catalogoColorFondo,
+  catalogoColorSuperficie: cfg.catalogoColorSuperficie,
+  catalogoColorTexto: cfg.catalogoColorTexto,
+  catalogoColorProducto: cfg.catalogoColorProducto,
+  catalogoColorSubtitulo: cfg.catalogoColorSubtitulo,
+  catalogoColorDescripcion: cfg.catalogoColorDescripcion,
+  catalogoColorCategoria: cfg.catalogoColorCategoria,
+  catalogoColorPrecio: cfg.catalogoColorPrecio,
   ...FOOTER_KEYS.reduce((acc, k) => { acc[k] = cfg[k]; return acc; }, {}),
 });
 
@@ -60,6 +78,11 @@ const getPublicConfig = async (req, res) => {
 
 const NUMERICOS = ['metaFacturacionDiaria', 'metaGananciaDiaria', 'metaFacturacionMensual', 'margenGananciaDefecto', 'pesosPorPunto'];
 const TEXTO = ['nombreTienda', 'catalogoTitulo', 'catalogoSubtitulo', 'catalogoTextoEnvio', 'catalogoTextoPago'];
+const COLORES = [
+  'catalogoColorAcento', 'catalogoColorFondo', 'catalogoColorSuperficie',
+  'catalogoColorTexto', 'catalogoColorProducto', 'catalogoColorSubtitulo',
+  'catalogoColorDescripcion', 'catalogoColorCategoria', 'catalogoColorPrecio',
+];
 const METODOS_PAGO = ['efectivo', 'tarjeta', 'tarjeta_debito', 'transferencia'];
 
 const updateConfig = async (req, res) => {
@@ -87,6 +110,17 @@ const updateConfig = async (req, res) => {
         return res.status(400).json({ message: `${key} es demasiado largo (máx. 300 caracteres)` });
       }
       config[key] = val;
+      changed = true;
+    }
+
+    // Colores del catálogo: formato hexadecimal #RRGGBB
+    for (const key of COLORES) {
+      if (req.body[key] === undefined) continue;
+      const val = String(req.body[key]).trim();
+      if (!/^#[0-9a-fA-F]{6}$/.test(val)) {
+        return res.status(400).json({ message: `${key} debe ser un color hexadecimal (#RRGGBB)` });
+      }
+      config[key] = val.toLowerCase();
       changed = true;
     }
 
